@@ -12,7 +12,10 @@ from astrbot.api import logger
 
 MAX_IMAGE_DOWNLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 
-_MODEL_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9._-]+$')
+_MODEL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
+_GCP_SEGMENT_PATTERN = re.compile(r"^[a-z0-9-]+$")
+
+DEFAULT_MODEL_NAME = "gemini-3-pro-image"
 
 
 def validate_model_name(name: str) -> str:
@@ -22,13 +25,24 @@ def validate_model_name(name: str) -> str:
     """
     name = (name or "").strip()
     if not name:
-        return "gemini-3-pro-image-preview"
+        return DEFAULT_MODEL_NAME
     if not _MODEL_NAME_PATTERN.match(name):
         raise ValueError(
             f"Invalid model_name '{name}': "
             "only alphanumeric, dots, hyphens, and underscores allowed"
         )
     return name
+
+
+def validate_gcp_segment(value: str, field: str) -> str:
+    """Validate a GCP project ID or location used as a URL path segment."""
+    value = (value or "").strip()
+    if value and not _GCP_SEGMENT_PATTERN.match(value):
+        raise ValueError(
+            f"Invalid {field} '{value}': "
+            "only lowercase letters, digits, and hyphens allowed"
+        )
+    return value
 
 
 async def is_safe_url(url: str) -> bool:
@@ -38,7 +52,7 @@ async def is_safe_url(url: str) -> bool:
     """
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'):
+        if parsed.scheme not in ("http", "https"):
             return False
         hostname = parsed.hostname
         if not hostname:
@@ -49,8 +63,13 @@ async def is_safe_url(url: str) -> bool:
 
         for family, _, _, _, sockaddr in addr_info:
             ip = ipaddress.ip_address(sockaddr[0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_multicast or ip.is_reserved):
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+            ):
                 logger.warning(f"Unsafe IP detected: {sockaddr[0]} ({hostname})")
                 return False
         return True
@@ -71,12 +90,15 @@ class SSRFSafeResolver(aiohttp.resolver.DefaultResolver):
     ) -> list[dict]:
         results = await super().resolve(host, port, family)
         for result in results:
-            ip = ipaddress.ip_address(result['host'])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_multicast or ip.is_reserved):
-                raise OSError(
-                    f"SSRF blocked: {result['host']} resolved from {host}"
-                )
+            ip = ipaddress.ip_address(result["host"])
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+            ):
+                raise OSError(f"SSRF blocked: {result['host']} resolved from {host}")
         return results
 
 
@@ -89,7 +111,7 @@ async def safe_download_image(
     """
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'):
+        if parsed.scheme not in ("http", "https"):
             logger.warning(f"Blocked non-HTTP URL scheme: {parsed.scheme}")
             return None
 

@@ -6,11 +6,25 @@
         "default": [],
         "obvious_hint": true
     },
+    "vertex_project_id": {
+        "description": "Google Cloud 项目 ID",
+        "type": "string",
+        "hint": "必填（推荐）。在 Google Cloud Console 顶部的项目选择器中查看。不填写时使用短路径，请求会被路由到随机区域，新模型可能返回 404。",
+        "default": "",
+        "obvious_hint": true
+    },
+    "vertex_location": {
+        "description": "Vertex AI 区域",
+        "type": "string",
+        "hint": "保持 global 即可。新模型通常只在 global 提供。",
+        "default": "global",
+        "obvious_hint": false
+    },
     "model_name": {
         "description": "使用的 Gemini 图像生成模型名称",
         "type": "string",
-        "hint": "直接填写模型名（无需前缀），如 gemini-3-pro-image-preview。可用模型见 README。",
-        "default": "gemini-3-pro-image-preview",
+        "hint": "直接填写模型名（无需前缀），如 gemini-3-pro-image、gemini-nano-banana-2.1。带 -preview 后缀的旧模型已下线。可用模型见 README。",
+        "default": "gemini-3-pro-image",
         "obvious_hint": true
     },
     "max_retry_attempts": {

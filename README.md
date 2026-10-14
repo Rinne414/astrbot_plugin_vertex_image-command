@@ -49,9 +49,12 @@
 #### 配置参数说明
 
 - **vertex_api_key**: Vertex AI API 密钥列表（⚠️ 仅支持 Vertex AI，AI Studio 的 Key 不可用）
+- **vertex_project_id**: Google Cloud 项目 ID（推荐填写）。不填写时请求会走不带项目的短路径，被路由到随机区域端点，新模型可能返回 404
+- **vertex_location**: Vertex AI 区域，默认 `global`，一般无需修改
 - **model_name**: 使用的 Gemini 图像生成模型名称（直接填写模型名，无需 `google/` 前缀）
-  - 默认值：`gemini-3-pro-image-preview`
-  - 推荐：`gemini-3.1-flash-image-preview`
+  - 默认值：`gemini-3-pro-image`
+  - 推荐：`gemini-nano-banana-2.1`（价格更低、速度更快）
+  - 带 `-preview` 后缀的旧模型名已下线，会返回 404
   - 可用模型参考：[Vertex AI 图像生成模型](https://cloud.google.com/vertex-ai/generative-ai/docs/image/generate-images#img-gen-models)
 
 - **aspect_ratio**: 生成图像的默认宽高比，留空则由模型自动决定
@@ -152,9 +155,10 @@
 
 ### 支持的模型
 
-- `gemini-3.1-flash-image-preview` (推荐)
-- `gemini-3-pro-image-preview` (最高支持 4096px)
-- `gemini-2.5-flash-image` (支持 1024px)
+- `gemini-nano-banana-2.1` (Nano Banana 2.1，推荐)
+- `gemini-3-pro-image` (Nano Banana Pro，文字渲染最准确，最高支持 4096px)
+- `gemini-3.1-flash-image` (Nano Banana 2)
+- `gemini-3.1-flash-lite-image` (Nano Banana 2 Lite，速度最快)
 
 ## 文件结构
 

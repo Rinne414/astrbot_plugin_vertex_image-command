@@ -10,7 +10,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from astrbot.api import logger
 
-from .security import safe_download_image, validate_model_name
+from .security import (
+    DEFAULT_MODEL_NAME,
+    safe_download_image,
+    validate_gcp_segment,
+    validate_model_name,
+)
 
 
 class ImageGeneratorState:
@@ -50,12 +55,19 @@ class ImageGeneratorState:
 _state = ImageGeneratorState()
 
 # 响应文本中图片信息的匹配模式
-_DATA_URL_PATTERN = re.compile(
-    r"(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+)"
-)
+_DATA_URL_PATTERN = re.compile(r"(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+)")
 _HTTP_URL_PATTERN = re.compile(r"(https?://[^\s)]+)")
 _SUPPORTED_ASPECT_RATIOS = {
-    "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9",
+    "1:1",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:3",
+    "4:5",
+    "5:4",
+    "9:16",
+    "16:9",
+    "21:9",
 }
 _IMAGE_SIZE_MAP = {
     1024: "1K",
@@ -123,7 +135,9 @@ async def cleanup_old_images(data_dir=None):
         # 查找images目录下的所有图像文件
         # B-01: 优化为一次遍历，减少 IO
         for file_path in images_dir.iterdir():
-            if file_path.is_file() and file_path.name.startswith(("vertex_image_", "gemini_image_")):
+            if file_path.is_file() and file_path.name.startswith(
+                ("vertex_image_", "gemini_image_")
+            ):
                 try:
                     file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
                     if file_mtime < cutoff_time:
@@ -202,13 +216,15 @@ async def get_saved_image_info():
 async def generate_image_vertex(
     prompt,
     api_key,
-    model: str = "gemini-3-pro-image-preview",
+    model: str = DEFAULT_MODEL_NAME,
     input_images=None,
     max_retry_attempts: int = 3,
     data_dir=None,
     safety_settings: dict | None = None,
     aspect_ratio: str = "",
     resolution: int = 0,
+    project_id: str = "",
+    location: str = "global",
 ):
     """
     使用 Google Vertex AI Gemini 模型生成图像
@@ -228,7 +244,7 @@ async def generate_image_vertex(
             阈值可选值: "OFF", "BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"
 
     Returns:
-        tuple: (image_url, image_path, error_reason) 
+        tuple: (image_url, image_path, error_reason)
                成功时 error_reason 为 None
                失败时 image_url 和 image_path 为 None，error_reason 包含错误类型：
                - "SAFETY_BLOCKED": 被安全策略阻止
@@ -251,8 +267,26 @@ async def generate_image_vertex(
     model = validate_model_name(model)
 
     # 构建 Vertex AI API URL
-    base_url = "https://aiplatform.googleapis.com/v1/publishers/google/models"
-    
+    # 不带 project 的短路径会被路由到随机区域端点，新模型在那里不存在（404），
+    # 因此配置了 project_id 时使用显式的 projects/{id}/locations/{location} 路径
+    project_id = validate_gcp_segment(project_id, "project_id")
+    location = validate_gcp_segment(location, "location") or "global"
+    if project_id:
+        host = (
+            "aiplatform.googleapis.com"
+            if location == "global"
+            else f"{location}-aiplatform.googleapis.com"
+        )
+        base_url = (
+            f"https://{host}/v1/projects/{project_id}/locations/{location}"
+            "/publishers/google/models"
+        )
+    else:
+        logger.warning(
+            "未配置 vertex_project_id，使用短路径；新模型可能返回 404，建议填写项目 ID"
+        )
+        base_url = "https://aiplatform.googleapis.com/v1/publishers/google/models"
+
     normalized_aspect_ratio = _normalize_aspect_ratio(aspect_ratio)
     normalized_image_size = _normalize_image_size(resolution)
     logger.info(
@@ -263,7 +297,7 @@ async def generate_image_vertex(
 
     # 构建请求内容
     parts = []
-    
+
     # 添加文本提示
     full_prompt = (
         "Generate an image based on the following description. "
@@ -271,7 +305,7 @@ async def generate_image_vertex(
         f"{prompt}"
     )
     parts.append({"text": full_prompt})
-    
+
     # 添加输入图像（如果有）
     if input_images:
         for img_base64 in input_images:
@@ -284,13 +318,10 @@ async def generate_image_vertex(
                         clean_base64 = clean_base64.split(",", 1)[1]
                     except IndexError:
                         pass
-                
-                parts.append({
-                    "inlineData": {
-                        "mimeType": "image/png",
-                        "data": clean_base64
-                    }
-                })
+
+                parts.append(
+                    {"inlineData": {"mimeType": "image/png", "data": clean_base64}}
+                )
         logger.info(f"已添加 {len(input_images)} 张参考图片")
 
     # 构建安全过滤器配置
@@ -302,17 +333,29 @@ async def generate_image_vertex(
         "sexually_explicit": "OFF",
         "dangerous_content": "OFF",
     }
-    
+
     if safety_settings:
         for key in default_thresholds:
             if key in safety_settings and safety_settings[key]:
                 default_thresholds[key] = safety_settings[key]
-    
+
     safety_settings_payload = [
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": default_thresholds["hate_speech"]},
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": default_thresholds["harassment"]},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": default_thresholds["sexually_explicit"]},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": default_thresholds["dangerous_content"]},
+        {
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "threshold": default_thresholds["hate_speech"],
+        },
+        {
+            "category": "HARM_CATEGORY_HARASSMENT",
+            "threshold": default_thresholds["harassment"],
+        },
+        {
+            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "threshold": default_thresholds["sexually_explicit"],
+        },
+        {
+            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "threshold": default_thresholds["dangerous_content"],
+        },
     ]
 
     generation_config = {
@@ -330,21 +373,16 @@ async def generate_image_vertex(
         generation_config["imageConfig"] = image_config
 
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": parts
-            }
-        ],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": generation_config,
-        "safetySettings": safety_settings_payload
+        "safetySettings": safety_settings_payload,
     }
 
     timeout = aiohttp.ClientTimeout(total=300)
 
     # 记录连续 429 错误次数，用于判断是否全部因限流失败
     rate_limit_count = 0
-    
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for retry_attempt in range(max_retry_attempts):
             try:
@@ -353,22 +391,22 @@ async def generate_image_vertex(
                     logger.error("无可用的 API 密钥")
                     return None, None, "NO_API_KEY"
 
-                url = f"{base_url}/{model}:generateContent?key={current_key}"
-                
+                # 密钥放在请求头而不是 URL 中，避免异常信息和日志泄露密钥
+                url = f"{base_url}/{model}:generateContent"
+
                 headers = {
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": current_key,
                 }
 
                 if retry_attempt > 0:
-                    delay = min(2 ** retry_attempt, 10)
-                    logger.info(
-                        f"第 {retry_attempt + 1} 次重试，等待 {delay} 秒..."
-                    )
+                    delay = min(2**retry_attempt, 10)
+                    logger.info(f"第 {retry_attempt + 1} 次重试，等待 {delay} 秒...")
                     await asyncio.sleep(delay)
 
                 async with session.post(url, json=payload, headers=headers) as response:
                     response_text = await response.text()
-                    
+
                     if retry_attempt == 0:
                         logger.debug(f"Vertex AI API 响应状态: {response.status}")
 
@@ -397,15 +435,19 @@ async def generate_image_vertex(
                                     inline_data = part["inlineData"]
                                     mime_type = inline_data.get("mimeType", "image/png")
                                     base64_string = inline_data.get("data")
-                                    
+
                                     # 从 MIME 类型提取格式
                                     if "/" in mime_type:
-                                        image_format = mime_type.split("/")[1].split(";")[0]
-                                    
+                                        image_format = mime_type.split("/")[1].split(
+                                            ";"
+                                        )[0]
+
                                     if base64_string:
-                                        logger.info(f"从响应中获取到图像数据，格式: {image_format}")
+                                        logger.info(
+                                            f"从响应中获取到图像数据，格式: {image_format}"
+                                        )
                                         break
-                                
+
                                 # 检查文本中是否包含 base64 图像
                                 elif "text" in part:
                                     text = part["text"]
@@ -414,19 +456,29 @@ async def generate_image_vertex(
                                     if data_match:
                                         candidate_url = data_match.group(1)
                                         try:
-                                            header, base64_part = candidate_url.split(",", 1)
-                                            image_format = header.split("/")[1].split(";")[0]
+                                            header, base64_part = candidate_url.split(
+                                                ",", 1
+                                            )
+                                            image_format = header.split("/")[1].split(
+                                                ";"
+                                            )[0]
                                             base64_string = base64_part
-                                            logger.info("从文本响应中提取到 base64 图像")
+                                            logger.info(
+                                                "从文本响应中提取到 base64 图像"
+                                            )
                                             break
                                         except Exception as e:
-                                            logger.warning(f"解析文本中的 data URL 失败: {e}")
-                                    
+                                            logger.warning(
+                                                f"解析文本中的 data URL 失败: {e}"
+                                            )
+
                                     # 尝试匹配 HTTP URL
                                     url_match = _HTTP_URL_PATTERN.search(text)
                                     if url_match:
                                         image_url = url_match.group(1)
-                                        logger.info(f"从文本响应中提取到图像 URL: {image_url}")
+                                        logger.info(
+                                            f"从文本响应中提取到图像 URL: {image_url}"
+                                        )
 
                         # 如果获取到 base64 图像数据，保存到文件
                         if base64_string:
@@ -441,7 +493,9 @@ async def generate_image_vertex(
                             try:
                                 img_data = await safe_download_image(image_url)
                                 if img_data:
-                                    base64_string = base64.b64encode(img_data).decode("utf-8")
+                                    base64_string = base64.b64encode(img_data).decode(
+                                        "utf-8"
+                                    )
                                     image_url, image_path = await save_base64_image(
                                         base64_string, image_format, data_dir
                                     )
@@ -454,17 +508,29 @@ async def generate_image_vertex(
                         if "promptFeedback" in data:
                             feedback = data["promptFeedback"]
                             if "blockReason" in feedback:
-                                logger.warning(f"请求被安全过滤阻止: {feedback['blockReason']}")
+                                logger.warning(
+                                    f"请求被安全过滤阻止: {feedback['blockReason']}"
+                                )
                                 return None, None, "SAFETY_BLOCKED"
 
                         # 检查 finishReason
                         if "candidates" in data and data["candidates"]:
-                            finish_reason = data["candidates"][0].get("finishReason", "")
-                            if finish_reason in ["IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "SAFETY"]:
-                                logger.warning(f"图像生成被安全策略阻止: {finish_reason}")
+                            finish_reason = data["candidates"][0].get(
+                                "finishReason", ""
+                            )
+                            if finish_reason in [
+                                "IMAGE_SAFETY",
+                                "IMAGE_PROHIBITED_CONTENT",
+                                "SAFETY",
+                            ]:
+                                logger.warning(
+                                    f"图像生成被安全策略阻止: {finish_reason}"
+                                )
                                 return None, None, "SAFETY_BLOCKED"
 
-                        logger.warning(f"响应中未找到图像数据，第 {retry_attempt + 1} 次尝试")
+                        logger.warning(
+                            f"响应中未找到图像数据，第 {retry_attempt + 1} 次尝试"
+                        )
                         await rotate_to_next_api_key(api_keys)
 
                     elif response.status == 429:
@@ -482,7 +548,9 @@ async def generate_image_vertex(
                         return None, None, "BAD_REQUEST"
 
                     elif response.status == 401 or response.status == 403:
-                        logger.error(f"API 认证失败 (状态码 {response.status})，尝试轮换密钥")
+                        logger.error(
+                            f"API 认证失败 (状态码 {response.status})，尝试轮换密钥"
+                        )
                         await rotate_to_next_api_key(api_keys)
 
                     else:
@@ -507,7 +575,7 @@ async def generate_image_vertex(
     if rate_limit_count >= max_retry_attempts:
         logger.error("Vertex AI API 调用失败：所有重试均因频率限制 (429) 被拒绝")
         return None, None, "RATE_LIMITED"
-    
+
     logger.error("Vertex AI API 调用失败，已达到最大重试次数")
     return None, None, "API_ERROR"
 
@@ -517,7 +585,5 @@ async def generate_image_openai(*args, **kwargs):
     """
     已废弃：请使用 generate_image_vertex
     """
-    logger.warning(
-        "generate_image_openai 已废弃，请使用 generate_image_vertex"
-    )
+    logger.warning("generate_image_openai 已废弃，请使用 generate_image_vertex")
     return await generate_image_vertex(*args, **kwargs)

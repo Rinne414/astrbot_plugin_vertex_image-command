@@ -10,12 +10,17 @@ from astrbot.api.all import Image, Plain
 from astrbot.core.message.components import Reply
 from .utils.ttp import generate_image_vertex
 from .utils.file_send_server import send_file
-from .utils.security import safe_download_image, validate_model_name
+from .utils.security import (
+    DEFAULT_MODEL_NAME,
+    safe_download_image,
+    validate_model_name,
+)
 
 
 @dataclass
 class EditSession:
     """多步骤改图会话状态"""
+
     images: list = field(default_factory=list)
     description: str = ""
     ratio: str = ""
@@ -23,7 +28,12 @@ class EditSession:
     created_at: float = field(default_factory=time.time)
 
 
-@register("astrbot_plugin_vertex_image_command", "YanL", "使用 Google Vertex AI 生成图片", "1.0.0")
+@register(
+    "astrbot_plugin_vertex_image_command",
+    "YanL",
+    "使用 Google Vertex AI 生成图片",
+    "1.0.0",
+)
 class MyPlugin(Star):
     _DEFAULT_EDIT_SESSION_TIMEOUT_SECONDS = 60
     _DEFAULT_MAX_EDIT_IMAGES = 10
@@ -36,7 +46,11 @@ class MyPlugin(Star):
 
         # 模型配置
         self.model_name = self._resolve_model_name(
-            config.get("model_name", "gemini-3-pro-image-preview")
+            config.get("model_name", DEFAULT_MODEL_NAME)
+        )
+        self.vertex_project_id = str(config.get("vertex_project_id", "") or "").strip()
+        self.vertex_location = (
+            str(config.get("vertex_location", "global") or "").strip() or "global"
         )
 
         # 重试配置
@@ -47,12 +61,20 @@ class MyPlugin(Star):
         self.nap_server_port = config.get("nap_server_port")
 
         # 群过滤配置（模式 + 名单）
-        self.group_filter_mode = str(config.get("group_filter_mode", "none") or "none").strip().lower()
-        self.group_filter_list = self._normalize_id_list(config.get("group_filter_list"))
+        self.group_filter_mode = (
+            str(config.get("group_filter_mode", "none") or "none").strip().lower()
+        )
+        self.group_filter_list = self._normalize_id_list(
+            config.get("group_filter_list")
+        )
 
         # 限流配置（按群）
-        self.rate_limit_max_calls_per_group = int(config.get("rate_limit_max_calls_per_group", 0) or 0)
-        self.rate_limit_period_seconds = int(config.get("rate_limit_period_seconds", 60) or 60)
+        self.rate_limit_max_calls_per_group = int(
+            config.get("rate_limit_max_calls_per_group", 0) or 0
+        )
+        self.rate_limit_period_seconds = int(
+            config.get("rate_limit_period_seconds", 60) or 60
+        )
 
         # 限流状态：group_id -> (window_start_ts, count)
         self._rate_limit_state: dict[str, tuple[float, int]] = {}
@@ -73,9 +95,7 @@ class MyPlugin(Star):
         self.max_edit_images = max(
             1,
             int(
-                config.get(
-                    "max_edit_images", self._DEFAULT_MAX_EDIT_IMAGES
-                )
+                config.get("max_edit_images", self._DEFAULT_MAX_EDIT_IMAGES)
                 or self._DEFAULT_MAX_EDIT_IMAGES
             ),
         )
@@ -106,7 +126,7 @@ class MyPlugin(Star):
         try:
             return validate_model_name(raw_name or "")
         except ValueError as e:
-            fallback = "gemini-3-pro-image-preview"
+            fallback = DEFAULT_MODEL_NAME
             logger.warning(f"模型名配置无效，已回退到默认模型 {fallback}: {e}")
             return fallback
 
@@ -123,32 +143,37 @@ class MyPlugin(Star):
     def _get_bot_client(self, event: AstrMessageEvent):
         """尝试从 event 中获取底层 OneBot client 实例"""
         client = None
-        if hasattr(event, 'raw_event') and event.raw_event:
+        if hasattr(event, "raw_event") and event.raw_event:
             raw = event.raw_event
-            if hasattr(raw, 'bot'):
+            if hasattr(raw, "bot"):
                 client = raw.bot
-            elif hasattr(raw, '_bot'):
+            elif hasattr(raw, "_bot"):
                 client = raw._bot
-        if not client and hasattr(self, 'context') and self.context:
-            if hasattr(self.context, 'get_platform_client'):
+        if not client and hasattr(self, "context") and self.context:
+            if hasattr(self.context, "get_platform_client"):
                 client = self.context.get_platform_client()
-            elif hasattr(self.context, 'platform_manager'):
+            elif hasattr(self.context, "platform_manager"):
                 pm = self.context.platform_manager
-                if hasattr(pm, 'get_client'):
-                    client = pm.get_client('aiocqhttp')
+                if hasattr(pm, "get_client"):
+                    client = pm.get_client("aiocqhttp")
         return client
 
     # ── Midjourney 风格标志解析 ─────────────────────────────────────
 
     _RATIO_FLAGS = {
-        "--16:9": "16:9", "-l": "16:9",
-        "--9:16": "9:16", "-p": "9:16",
-        "--1:1": "1:1", "-s": "1:1",
+        "--16:9": "16:9",
+        "-l": "16:9",
+        "--9:16": "9:16",
+        "-p": "9:16",
+        "--1:1": "1:1",
+        "-s": "1:1",
         "--4:3": "4:3",
         "--3:4": "3:4",
     }
     _RES_FLAGS = {
-        "--1k": 1024, "--2k": 2048, "--4k": 4096,
+        "--1k": 1024,
+        "--2k": 2048,
+        "--4k": 4096,
     }
 
     def _parse_flags(self, text: str) -> tuple[str, int, str]:
@@ -192,7 +217,9 @@ class MyPlugin(Star):
                 return tuple(dict.fromkeys([value.strip(), *prefixes]))
         return tuple(prefixes)
 
-    async def _send_ephemeral(self, event: AstrMessageEvent, text: str, delay: float = 5.0) -> bool:
+    async def _send_ephemeral(
+        self, event: AstrMessageEvent, text: str, delay: float = 5.0
+    ) -> bool:
         """发送临时消息，delay 秒后自动撤回。成功返回 True，失败返回 False。"""
         try:
             client = self._get_bot_client(event)
@@ -212,32 +239,41 @@ class MyPlugin(Star):
 
             result = None
             if group_id:
-                if hasattr(client, 'call_api'):
-                    result = await client.call_api('send_group_msg', group_id=int(group_id), message=text)
-                elif hasattr(client, 'send_group_msg'):
-                    result = await client.send_group_msg(group_id=int(group_id), message=text)
+                if hasattr(client, "call_api"):
+                    result = await client.call_api(
+                        "send_group_msg", group_id=int(group_id), message=text
+                    )
+                elif hasattr(client, "send_group_msg"):
+                    result = await client.send_group_msg(
+                        group_id=int(group_id), message=text
+                    )
             elif user_id:
-                if hasattr(client, 'call_api'):
-                    result = await client.call_api('send_private_msg', user_id=int(user_id), message=text)
-                elif hasattr(client, 'send_private_msg'):
-                    result = await client.send_private_msg(user_id=int(user_id), message=text)
+                if hasattr(client, "call_api"):
+                    result = await client.call_api(
+                        "send_private_msg", user_id=int(user_id), message=text
+                    )
+                elif hasattr(client, "send_private_msg"):
+                    result = await client.send_private_msg(
+                        user_id=int(user_id), message=text
+                    )
 
             if not result:
                 return False
 
             msg_id = None
             if isinstance(result, dict):
-                msg_id = result.get('message_id')
-            elif hasattr(result, 'message_id'):
+                msg_id = result.get("message_id")
+            elif hasattr(result, "message_id"):
                 msg_id = result.message_id
 
             if msg_id:
+
                 async def _delete_later():
                     await asyncio.sleep(delay)
                     try:
-                        if hasattr(client, 'call_api'):
-                            await client.call_api('delete_msg', message_id=int(msg_id))
-                        elif hasattr(client, 'delete_msg'):
+                        if hasattr(client, "call_api"):
+                            await client.call_api("delete_msg", message_id=int(msg_id))
+                        elif hasattr(client, "delete_msg"):
                             await client.delete_msg(message_id=int(msg_id))
                     except Exception as e:
                         logger.debug(f"撤回消息失败（可能无权限）: {e}")
@@ -278,7 +314,13 @@ class MyPlugin(Star):
 
     # ── Vertex AI 生成 ────────────────────────────────────────────
 
-    async def _generate_image_via_provider(self, prompt: str, input_images: list | None, aspect_ratio: str = "", resolution: int = 0):
+    async def _generate_image_via_provider(
+        self,
+        prompt: str,
+        input_images: list | None,
+        aspect_ratio: str = "",
+        resolution: int = 0,
+    ):
         """
         调用 Vertex AI 图像生成。
 
@@ -289,9 +331,7 @@ class MyPlugin(Star):
             logger.error("未配置 vertex_api_key，无法生成图像")
             return None, None, "NO_API_KEY"
 
-        logger.info(
-            f"使用 Vertex AI 生成图像，model={self.model_name}"
-        )
+        logger.info(f"使用 Vertex AI 生成图像，model={self.model_name}")
 
         data_dir = StarTools.get_data_dir("vertex_image-command")
 
@@ -305,6 +345,8 @@ class MyPlugin(Star):
             safety_settings=self.safety_settings,
             aspect_ratio=aspect_ratio or self.aspect_ratio,
             resolution=resolution or self.default_resolution,
+            project_id=self.vertex_project_id,
+            location=self.vertex_location,
         )
 
     def _format_timeout_message(self) -> str:
@@ -397,7 +439,10 @@ class MyPlugin(Star):
         return True
 
     async def _check_and_consume_rate_limit(self, event: AstrMessageEvent) -> bool:
-        if self.rate_limit_max_calls_per_group <= 0 or self.rate_limit_period_seconds <= 0:
+        if (
+            self.rate_limit_max_calls_per_group <= 0
+            or self.rate_limit_period_seconds <= 0
+        ):
             return True
         group_id = None
         try:
@@ -414,7 +459,9 @@ class MyPlugin(Star):
                 window_start = now
                 count = 0
             if count >= self.rate_limit_max_calls_per_group:
-                logger.info(f"群 {gid} 已达到限流上限 ({count}/{self.rate_limit_max_calls_per_group})")
+                logger.info(
+                    f"群 {gid} 已达到限流上限 ({count}/{self.rate_limit_max_calls_per_group})"
+                )
                 return False
             self._rate_limit_state[gid] = (window_start, count + 1)
             return True
@@ -424,7 +471,9 @@ class MyPlugin(Star):
     # ── 错误消息 ──────────────────────────────────────────────────
 
     @staticmethod
-    def _get_error_message(error_reason: str | None, command_name: str = "图像生成") -> str:
+    def _get_error_message(
+        error_reason: str | None, command_name: str = "图像生成"
+    ) -> str:
         if error_reason == "SAFETY_BLOCKED":
             return f"⚠️ {command_name}被安全策略阻止，请尝试调整提示词或更换图片后重试。"
         if error_reason == "NO_API_KEY":
@@ -446,7 +495,11 @@ class MyPlugin(Star):
         reply_id: str | None = None
         reply_images_found = False
 
-        if hasattr(event, "message_obj") and event.message_obj and hasattr(event.message_obj, "message"):
+        if (
+            hasattr(event, "message_obj")
+            and event.message_obj
+            and hasattr(event.message_obj, "message")
+        ):
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):
                     try:
@@ -458,14 +511,14 @@ class MyPlugin(Star):
                     except Exception as e:
                         logger.error(f"处理图片时出现未预期的错误: {e}")
                 elif isinstance(comp, Reply):
-                    if hasattr(comp, 'id') and comp.id:
+                    if hasattr(comp, "id") and comp.id:
                         reply_id = str(comp.id)
-                    elif hasattr(comp, 'message_id') and comp.message_id:
+                    elif hasattr(comp, "message_id") and comp.message_id:
                         reply_id = str(comp.message_id)
-                    elif hasattr(comp, 'data') and isinstance(comp.data, dict):
-                        reply_id = str(comp.data.get('id', ''))
+                    elif hasattr(comp, "data") and isinstance(comp.data, dict):
+                        reply_id = str(comp.data.get("id", ""))
 
-                    if hasattr(comp, 'chain') and comp.chain:
+                    if hasattr(comp, "chain") and comp.chain:
                         for reply_comp in comp.chain:
                             if isinstance(reply_comp, Image):
                                 try:
@@ -474,11 +527,19 @@ class MyPlugin(Star):
                                     logger.info("从引用消息中获取到图片")
                                     reply_images_found = True
                                 except (IOError, ValueError, OSError) as e:
-                                    logger.warning(f"转换引用消息中的图片到base64失败: {e}")
+                                    logger.warning(
+                                        f"转换引用消息中的图片到base64失败: {e}"
+                                    )
                                 except Exception as e:
-                                    logger.error(f"处理引用消息中的图片时出现未预期的错误: {e}")
+                                    logger.error(
+                                        f"处理引用消息中的图片时出现未预期的错误: {e}"
+                                    )
 
-                    if not reply_images_found and hasattr(comp, 'message') and comp.message:
+                    if (
+                        not reply_images_found
+                        and hasattr(comp, "message")
+                        and comp.message
+                    ):
                         for reply_comp in comp.message:
                             if isinstance(reply_comp, Image):
                                 try:
@@ -490,13 +551,17 @@ class MyPlugin(Star):
                                     logger.warning(f"处理引用消息图片失败: {e}")
 
         if reply_id and not reply_images_found and not images:
-            logger.info(f"Reply.chain 为空，尝试通过 API 获取被引用消息 (id={reply_id})")
+            logger.info(
+                f"Reply.chain 为空，尝试通过 API 获取被引用消息 (id={reply_id})"
+            )
             fetched_images = await self._fetch_reply_images_via_api(event, reply_id)
             images.extend(fetched_images)
 
         return images
 
-    async def _fetch_reply_images_via_api(self, event: AstrMessageEvent, reply_id: str) -> list[str]:
+    async def _fetch_reply_images_via_api(
+        self, event: AstrMessageEvent, reply_id: str
+    ) -> list[str]:
         """通过 OneBot API 获取被引用消息中的图片。"""
         images: list[str] = []
         try:
@@ -504,9 +569,9 @@ class MyPlugin(Star):
             if not client:
                 logger.debug("无法获取底层 client，跳过 API 获取")
                 return images
-            if hasattr(client, 'call_api'):
-                result = await client.call_api('get_msg', message_id=int(reply_id))
-            elif hasattr(client, 'get_msg'):
+            if hasattr(client, "call_api"):
+                result = await client.call_api("get_msg", message_id=int(reply_id))
+            elif hasattr(client, "get_msg"):
                 result = await client.get_msg(message_id=int(reply_id))
             else:
                 logger.debug("client 没有 call_api 或 get_msg 方法")
@@ -517,8 +582,8 @@ class MyPlugin(Star):
             logger.info(f"成功获取被引用消息: {type(result)}")
             message_content = None
             if isinstance(result, dict):
-                message_content = result.get('message', [])
-            elif hasattr(result, 'message'):
+                message_content = result.get("message", [])
+            elif hasattr(result, "message"):
                 message_content = result.message
             if not message_content:
                 return images
@@ -526,16 +591,16 @@ class MyPlugin(Star):
                 seg_type = None
                 seg_data = None
                 if isinstance(seg, dict):
-                    seg_type = seg.get('type')
-                    seg_data = seg.get('data', {})
-                elif hasattr(seg, 'type'):
+                    seg_type = seg.get("type")
+                    seg_data = seg.get("data", {})
+                elif hasattr(seg, "type"):
                     seg_type = seg.type
-                    seg_data = getattr(seg, 'data', {})
-                if seg_type == 'image':
+                    seg_data = getattr(seg, "data", {})
+                if seg_type == "image":
                     img_url = None
                     if isinstance(seg_data, dict):
-                        img_url = seg_data.get('url') or seg_data.get('file')
-                    elif hasattr(seg_data, 'url'):
+                        img_url = seg_data.get("url") or seg_data.get("file")
+                    elif hasattr(seg_data, "url"):
                         img_url = seg_data.url
                     if img_url:
                         logger.info(f"从被引用消息获取到图片 URL: {img_url[:50]}...")
@@ -543,7 +608,7 @@ class MyPlugin(Star):
                         if not img_bytes:
                             logger.warning(f"安全下载引用图片失败: {img_url}")
                             continue
-                        base64_data = base64.b64encode(img_bytes).decode('utf-8')
+                        base64_data = base64.b64encode(img_bytes).decode("utf-8")
                         images.append(base64_data)
                         logger.info("成功通过 API 获取被引用消息中的图片")
         except Exception as e:
@@ -553,13 +618,17 @@ class MyPlugin(Star):
     def _extract_text_from_message(self, event: AstrMessageEvent, command: str) -> str:
         """从消息中提取文本内容（排除指令本身）"""
         text_parts: list[str] = []
-        if hasattr(event, "message_obj") and event.message_obj and hasattr(event.message_obj, "message"):
+        if (
+            hasattr(event, "message_obj")
+            and event.message_obj
+            and hasattr(event.message_obj, "message")
+        ):
             for comp in event.message_obj.message:
                 if isinstance(comp, Plain):
                     try:
-                        if hasattr(comp, 'text') and comp.text:
+                        if hasattr(comp, "text") and comp.text:
                             text = str(comp.text)
-                        elif hasattr(comp, 'toString'):
+                        elif hasattr(comp, "toString"):
                             text = comp.toString()
                         else:
                             text = str(comp)
@@ -572,10 +641,10 @@ class MyPlugin(Star):
             if raw:
                 text_parts.append(raw)
         full_text = " ".join(text_parts)
-        pattern = rf'/?{re.escape(command)}[\s]*'
-        full_text = re.sub(pattern, '', full_text, count=1)
-        full_text = re.sub(r'[ \t]+', ' ', full_text)
-        full_text = re.sub(r'\n\s*\n', '\n', full_text)
+        pattern = rf"/?{re.escape(command)}[\s]*"
+        full_text = re.sub(pattern, "", full_text, count=1)
+        full_text = re.sub(r"[ \t]+", " ", full_text)
+        full_text = re.sub(r"\n\s*\n", "\n", full_text)
         full_text = full_text.strip()
         return full_text
 
@@ -637,7 +706,11 @@ class MyPlugin(Star):
 
         try:
             async with self._concurrency_limit:
-                image_url, image_path, error_reason = await self._generate_image_via_provider(
+                (
+                    image_url,
+                    image_path,
+                    error_reason,
+                ) = await self._generate_image_via_provider(
                     image_description,
                     input_images=input_images,
                     aspect_ratio=ratio,
@@ -650,7 +723,9 @@ class MyPlugin(Star):
                 return
 
             if self.nap_server_address and self.nap_server_address != "localhost":
-                image_path = await send_file(image_path, HOST=nap_server_address, PORT=nap_server_port)
+                image_path = await send_file(
+                    image_path, HOST=nap_server_address, PORT=nap_server_port
+                )
 
             image_component = await self.send_image_with_callback_api(image_path)
             yield event.chain_result([image_component])
@@ -684,7 +759,7 @@ class MyPlugin(Star):
         ignored_initial_images = 0
         if len(initial_images) > self.max_edit_images:
             ignored_initial_images = len(initial_images) - self.max_edit_images
-            initial_images = initial_images[:self.max_edit_images]
+            initial_images = initial_images[: self.max_edit_images]
 
         self._edit_sessions[key] = EditSession(
             images=initial_images,
@@ -733,13 +808,21 @@ class MyPlugin(Star):
                 yield event.plain_result(no_img_msg)
             return
 
-        description = session.description or "请在保持主体内容不变的前提下，对这张图片进行美化。"
+        description = (
+            session.description or "请在保持主体内容不变的前提下，对这张图片进行美化。"
+        )
 
-        logger.info(f"改图确认，共 {len(session.images)} 张图片，描述: {description[:50]}")
+        logger.info(
+            f"改图确认，共 {len(session.images)} 张图片，描述: {description[:50]}"
+        )
 
         try:
             async with self._concurrency_limit:
-                image_url, image_path, error_reason = await self._generate_image_via_provider(
+                (
+                    image_url,
+                    image_path,
+                    error_reason,
+                ) = await self._generate_image_via_provider(
                     description,
                     input_images=session.images,
                     aspect_ratio=session.ratio,
@@ -752,7 +835,9 @@ class MyPlugin(Star):
                 return
 
             if self.nap_server_address and self.nap_server_address != "localhost":
-                image_path = await send_file(image_path, HOST=self.nap_server_address, PORT=self.nap_server_port)
+                image_path = await send_file(
+                    image_path, HOST=self.nap_server_address, PORT=self.nap_server_port
+                )
 
             image_component = await self.send_image_with_callback_api(image_path)
             yield event.chain_result([Plain("✨ 改图完成！"), image_component])
